@@ -1,0 +1,11 @@
+{
+    "display_name": "실리북스 챕터",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Silly Books",
+    "version": "1.0.0",
+    "description": "실리북스 챕터 연동"
+}
