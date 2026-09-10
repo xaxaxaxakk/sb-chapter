@@ -1,3 +1,4 @@
+import { ensureBookExportButton } from './book-export.js';
 import { eventSource, event_types } from '../../../../script.js';
 import { getContext } from '../../../extensions.js';
 
@@ -38,9 +39,6 @@ function updateButton(button, active) {
     button.dataset.chapterActive = String(active);
     button.style.color = active ? 'var(--fullred, #d43c3c)' : '';
     button.style.opacity = active ? '1' : '';
-
-    button.classList.toggle('fa-solid', active);
-    button.classList.toggle('fa-regular', !active);
 }
 
 async function writeChapterMarker(messageId, active, onRollback) {
@@ -56,12 +54,12 @@ async function writeChapterMarker(messageId, active, onRollback) {
     try {
         setChapterMarker(message, active);
         await context.saveChat();
-        globalThis.toastr?.success(active ? '챕터 시작점으로 등록했어요.' : '챕터 지정을 해제했어요.');
+        globalThis.toastr?.success(active ? '챕터 시작점으로 등록 완료' : '챕터 지정 해제');
         return true;
     } catch (error) {
         setChapterMarker(message, wasActive);
         onRollback?.(wasActive);
-        globalThis.toastr?.error('챕터 정보를 저장하지 못했어요.');
+        globalThis.toastr?.error('챕터 정보를 저장하지 못했습니다.');
         console.error('챕터 정보 저장 실패.', error);
         return false;
     } finally {
@@ -89,7 +87,7 @@ function addButton(messageElement) {
     let button = actions.querySelector(`.${BUTTON_CLASS}`);
     if (!button) {
         button = document.createElement('div');
-        button.className = `mes_button ${BUTTON_CLASS} interactable fa-regular fa-bookmark`;
+        button.className = `mes_button ${BUTTON_CLASS} interactable fa-solid fa-book-bookmark`;
         button.setAttribute('role', 'button');
         button.setAttribute('tabindex', '0');
         button.addEventListener('click', async (event) => {
@@ -197,7 +195,7 @@ async function openChapterManager() {
     const context = getContext();
     const { Popup, POPUP_TYPE } = context;
     if (!Popup || !POPUP_TYPE) {
-        globalThis.toastr?.error('이 버전의 SillyTavern에서는 챕터 관리창을 열 수 없어요.');
+        globalThis.toastr?.error('이 버전의 실리태번에서는 챕터 관리창을 열 수 없습니다.');
         return;
     }
 
@@ -244,6 +242,7 @@ function queueInject() {
     injectFrame = requestAnimationFrame(() => {
         injectFrame = 0;
         ensureWandButton();
+        ensureBookExportButton();
         injectButtons();
     });
 }
