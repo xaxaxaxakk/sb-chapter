@@ -155,10 +155,10 @@ async function exportBook(button) {
         files['manifest.json'] = strToU8(JSON.stringify(manifest));
         const archive = zipSync(files, { level: 0 });
         if (archive.byteLength > MAX_BYTES) throw new Error('책이 256MB를 넘습니다. 이미지 수를 줄여 주세요.');
-        const url = URL.createObjectURL(new Blob([archive], { type: 'application/octet-stream' }));
+        const url = URL.createObjectURL(new Blob([archive], { type: 'application/zip' }));
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${manifest.title.replace(/[<>:"/\\|?*]/g, '_')}.sillybooks`;
+        link.download = `${manifest.title.replace(/[<>:"/\\|?*]/g, '_')}.sillybooks.zip`;
         document.body.append(link);
         link.click();
         link.remove();

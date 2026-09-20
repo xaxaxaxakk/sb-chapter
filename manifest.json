@@ -5,6 +5,6 @@
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "description": "실리북스 연동 확장"
 }
