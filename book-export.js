@@ -1,8 +1,7 @@
 import { getContext, extension_settings } from '../../../extensions.js';
 import { user_avatar } from '../../../../script.js';
-import { zipSync, strToU8 } from './fflate.js';
+import { sourceOf, jsonSource, writeArchive } from './archive-stream.js';
 
-const MAX_BYTES = 256 * 1024 * 1024;
 const EXPORT_LABEL = '실리북스로 내보내기';
 let exporting = false;
 const setExportLabel = (button, text) => { button.querySelector('.sb-book-export-label').textContent = text; };
@@ -22,6 +21,7 @@ async function buildAssetIndex(context) {
         const base = options.linkedCharacter || name;
         const effective = options.activeAssetPreset ? `${base}/${options.activeAssetPreset}` : base;
         const response = await fetch(`/api/sprites/get?name=${encodeURIComponent(effective)}`, { credentials: 'same-origin' });
+        if (response.status === 404) continue;
         if (!response.ok) throw new Error(`에셋 폴더 목록을 읽지 못했습니다: ${effective} (HTTP ${response.status})`);
         const assets = await response.json();
         if (!Array.isArray(assets)) throw new Error(`에셋 목록 형식이 잘못되었습니다: ${effective}`);
@@ -49,6 +49,33 @@ function imageExtension(bytes, mime) {
     if (header.slice(4, 8) === 'ftyp' && /avif|avis/.test(header)) return 'avif';
     if (mime === 'image/avif') return 'avif';
     throw new Error('지원하는 이미지 파일이 아닙니다');
+}
+function imageTagSource(tag) {
+    const quoted = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
+    if (quoted) return quoted[1].trim();
+    const bare = tag.match(/\bsrc\s*=\s*([^\s"'=<>`]+)/i);
+    return bare ? bare[1] : '';
+}
+function pruneText(text, missing) {
+    return text
+        .replace(/<img\b[^>]*>/gi, tag => missing.has(imageTagSource(tag)) ? '' : tag)
+        .replace(/!\[[^\]]*\]\(([^)]+)\)/g, (tag, source) => missing.has(source.trim()) ? '' : tag)
+        .replace(/\{\{\s*img::\s*([^{}]+?)\s*\}\}/gi, (tag, source) => missing.has(source.trim().replace(/\\_/g, '_')) ? '' : tag);
+}
+function prune(value, missing) {
+    if (typeof value === 'string') return pruneText(value, missing);
+    if (Array.isArray(value)) return value.map(item => prune(item, missing));
+    if (!value || typeof value !== 'object') return value;
+    const result = {};
+    for (const [key, item] of Object.entries(value)) {
+        if (['image', 'image_url'].includes(key) && typeof item === 'string' && missing.has(item)) continue;
+        if (key === 'image_swipes' && Array.isArray(item)) result[key] = item.filter(url => typeof url !== 'string' || !missing.has(url));
+        else if (key === 'media' && Array.isArray(item)) result[key] = item.filter(media => !(media?.url && (!media.type || media.type === 'image') && missing.has(media.url)));
+        else if (key === 'files' && Array.isArray(item)) result[key] = item.filter(file => !(file?.url && missing.has(file.url)));
+        else if (['force_avatar', 'original_avatar', 'avatar', 'persona_avatar', 'user_avatar'].includes(key)) result[key] = item;
+        else result[key] = prune(item, missing);
+    }
+    return result;
 }
 function stableId(text) {
     return [0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35].map(seed => {
@@ -79,12 +106,13 @@ export function ensureBookExportButton() {
 async function exportBook(button) {
     if (exporting) return;
     exporting = true;
+    let cleanup;
     button.setAttribute('aria-disabled', 'true');
     try {
         const context = getContext();
         if (!context.chat?.length) throw new Error('먼저 내보낼 채팅방을 열어 주세요.');
         if (context.streamingProcessor && !context.streamingProcessor.isFinished) throw new Error('답변 생성이 끝난 뒤 내보내 주세요.');
-        const messages = structuredClone(context.chat);
+        const messages = context.chat.slice();
         const character = context.characters?.[context.characterId];
         const identity = JSON.stringify([context.groupId || character?.avatar || context.name2, context.chatId || context.getCurrentChatId()]);
         const id = stableId(identity);
@@ -98,25 +126,29 @@ async function exportBook(button) {
             } else if (Array.isArray(value)) value.forEach(collect);
             else if (value && typeof value === 'object') {
                 for (const [key, item] of Object.entries(value)) {
-                    if (['image', 'image_url', 'force_avatar'].includes(key) && typeof item === 'string') sources.add(item);
+                    if (['image', 'image_url'].includes(key) && typeof item === 'string') sources.add(item);
                     if (key === 'image_swipes' && Array.isArray(item)) item.filter(url => typeof url === 'string').forEach(url => sources.add(url));
                     if (key === 'media' && Array.isArray(item)) item.forEach(media => { if (media?.url && (!media.type || media.type === 'image')) sources.add(media.url); });
                     if (key === 'files' && Array.isArray(item)) item.forEach(file => { if (file?.url && /\.(png|jpe?g|gif|webp|avif|bmp)(?:[?#].*)?$/i.test(file.name || file.url)) sources.add(file.url); });
-                    collect(item);
+                    if (!['force_avatar', 'original_avatar', 'avatar', 'persona_avatar', 'user_avatar'].includes(key)) collect(item);
                 }
             }
         }
-        collect(messages);
+
+        const root = await navigator.storage.getDirectory();
+        const staging = await root.getDirectoryHandle('sb-chapter-' + crypto.randomUUID(), { create: true });
+        cleanup = () => root.removeEntry(staging.name, { recursive: true });
+        for (let index = 0; index < messages.length; index++) {
+            collect(JSON.parse(JSON.stringify(messages[index])));
+            if (index % 100 === 0) setExportLabel(button, `본문 살피는 중 ${index + 1}/${messages.length}`);
+        }
+        const files = {};
         const hasNamedAssets = [...sources].some(source => !/^(?:[a-z]+:|\/)/i.test(source) && !source.includes('/'));
         const assetIndex = hasNamedAssets ? await buildAssetIndex(context) : new Map();
         if (character?.avatar) { manifest.characterAvatar = `/characters/${encodeURIComponent(character.avatar)}`; sources.add(manifest.characterAvatar); }
-        if (user_avatar) { manifest.personaAvatar = user_avatar === 'img/user-default.png' ? '/img/user-default.png' : `/User%20Avatars/${encodeURIComponent(user_avatar)}`; sources.add(manifest.personaAvatar); }
-        const header = { user_name: context.name1, character_name: context.name2, chat_metadata: { silly_books_export: true } };
-        const files = { 'chat.jsonl': strToU8([header, ...messages].map(value => JSON.stringify(value)).join('\n')) };
-        let size = files['chat.jsonl'].byteLength;
-        if (size > MAX_BYTES) throw new Error('채팅의 용량이 매우 큽니다. 256MB 이하만 지원됩니다.');
         let cursor = 0;
         const failures = [];
+        const missing = new Set();
         const bundledUrls = new Map();
         for (const source of sources) {
             setExportLabel(button, `이미지 모으는 중 ${++cursor}/${sources.size}`);
@@ -131,39 +163,56 @@ async function exportBook(button) {
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), 15000);
                 let response;
-                let bytes;
+                let imageFile;
                 try {
                     response = await fetch(url, { credentials: url.origin === location.origin ? 'same-origin' : 'omit', signal: controller.signal });
                     if (!response.ok) throw new Error(`이미지 읽기 실패 (HTTP ${response.status})`);
-                    if (Number(response.headers.get('content-length')) > MAX_BYTES - size) throw new Error('asset too large');
-                    bytes = new Uint8Array(await response.arrayBuffer());
+                    if (!response.body) throw new Error('이미지 데이터를 읽지 못했습니다.');
+                    const imageHandle = await staging.getFileHandle('image-' + cursor, { create: true });
+                    await response.body.pipeTo(await imageHandle.createWritable());
+                    imageFile = await imageHandle.getFile();
                 } finally { clearTimeout(timer); }
                 const mime = response.headers.get('content-type')?.split(';')[0];
-                const ext = imageExtension(bytes, mime);
-                if (size + bytes.byteLength > MAX_BYTES) throw new Error('asset too large');
-                size += bytes.byteLength;
+                const ext = imageExtension(new Uint8Array(await imageFile.slice(0, 32).arrayBuffer()), mime);
                 const path = `assets/${cursor}.${ext}`;
-                files[path] = bytes;
+                files[path] = sourceOf(imageFile);
                 manifest.assets[source] = path;
                 bundledUrls.set(url.href, path);
             } catch (error) {
                 failures.push(`${source}: ${error.message || '읽기 실패'}`);
+                missing.add(source);
                 manifest.missingAssets.push(source);
             }
         }
-        if (failures.length) console.warn('[실리북스] 찾을 수 없는 이미지를 빼고 내보냈습니다.', failures);
-        files['manifest.json'] = strToU8(JSON.stringify(manifest));
-        const archive = zipSync(files, { level: 0 });
-        if (archive.byteLength > MAX_BYTES) throw new Error('책이 256MB를 넘습니다. 이미지 수를 줄여 주세요.');
-        const url = URL.createObjectURL(new Blob([archive], { type: 'application/zip' }));
+        if (missing.has(manifest.characterAvatar)) delete manifest.characterAvatar;
+        if (failures.length) console.warn('[실리북스] 찾지 못해 본문에서 지운 이미지:', failures);
+        const bodyHandle = await staging.getFileHandle('chat.jsonl', { create: true });
+        const bodyWriter = await bodyHandle.createWritable();
+        const header = { user_name: context.name1, character_name: context.name2, chat_metadata: { silly_books_export: true } };
+        try {
+            await bodyWriter.write(JSON.stringify(header));
+            for (let index = 0; index < messages.length; index++) {
+                const text = JSON.stringify(messages[index]);
+                await bodyWriter.write('\n' + (missing.size ? JSON.stringify(prune(JSON.parse(text), missing)) : text));
+                if (index % 100 === 0) setExportLabel(button, `본문 준비 중 ${index + 1}/${messages.length}`);
+            }
+            await bodyWriter.close();
+        } catch (error) { await bodyWriter.abort().catch(() => {}); throw error; }
+        files['chat.jsonl'] = sourceOf(await bodyHandle.getFile());
+        files['manifest.json'] = jsonSource(manifest);
+        const archiveHandle = await staging.getFileHandle('book.zip', { create: true });
+        const output = await archiveHandle.createWritable();
+        try { await writeArchive(files, output, (_, index, count) => setExportLabel(button, `저장 중 ${index}/${count}`)); }
+        catch (error) { await output.abort().catch(() => {}); throw error; }
+        const url = URL.createObjectURL(await archiveHandle.getFile());
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${manifest.title.replace(/[<>:"/\\|?*]/g, '_')}.sillybooks.zip`;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
-        globalThis.toastr?.success(failures.length ? '찾을 수 없는 이미지를 제외한 채팅 내용을 실리북스로 내보냈습니다.' : `채팅과 이미지 ${Object.keys(manifest.assets).length}개를 담아 실리북스로 내보냈습니다.`);
+        link.download = manifest.title.replace(/[<>:"/\\|?*]/g, '_') + '.sillybooks.zip';
+        document.body.append(link); link.click(); link.remove();
+        const remove = cleanup; cleanup = undefined;
+        setTimeout(() => { URL.revokeObjectURL(url); void remove?.().catch(() => {}); }, 60000);
+        const dropped = missing.size ? ` 찾지 못한 이미지 ${missing.size}개는 본문에서 지웠습니다.` : '';
+        globalThis.toastr?.success(`채팅과 이미지 ${Object.keys(manifest.assets).length}개를 담아 실리북스로 내보냈습니다.${dropped}`);
     } catch (error) { globalThis.toastr?.error(error.message || '책을 내보내지 못했습니다.'); }
-    finally { exporting = false; button.removeAttribute('aria-disabled'); setExportLabel(button, EXPORT_LABEL); }
+    finally { await cleanup?.().catch(() => {}); exporting = false; button.removeAttribute('aria-disabled'); setExportLabel(button, EXPORT_LABEL); }
 }
