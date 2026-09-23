@@ -5,6 +5,9 @@ import { getContext } from '../../../extensions.js';
 const CHAPTER_FIELD = 'silly_books_chapter';
 const BUTTON_CLASS = 'sb-chapter-toggle';
 const savingMessages = new Set();
+const pendingMessages = new Set();
+let refreshAllMessages = false;
+let refreshMenu = false;
 let injectFrame = 0;
 
 function hasChapterMarker(message) {
@@ -33,12 +36,15 @@ function setChapterMarker(message, active) {
 function updateButton(button, active) {
     const label = active ? '챕터 시작 해제' : '챕터 시작으로 등록';
 
-    button.title = label;
-    button.setAttribute('aria-label', label);
-    button.setAttribute('aria-pressed', String(active));
-    button.dataset.chapterActive = String(active);
-    button.style.color = active ? 'var(--fullred, #d43c3c)' : '';
-    button.style.opacity = active ? '1' : '';
+    const state = String(active);
+    const color = active ? 'var(--fullred, #d43c3c)' : '';
+    const opacity = active ? '1' : '';
+    if (button.title !== label) button.title = label;
+    if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label);
+    if (button.getAttribute('aria-pressed') !== state) button.setAttribute('aria-pressed', state);
+    if (button.dataset.chapterActive !== state) button.dataset.chapterActive = state;
+    if (button.style.color !== color) button.style.color = color;
+    if (button.style.opacity !== opacity) button.style.opacity = opacity;
 }
 
 async function writeChapterMarker(messageId, active, onRollback) {
@@ -64,11 +70,12 @@ async function writeChapterMarker(messageId, active, onRollback) {
         return false;
     } finally {
         savingMessages.delete(messageId);
-        queueInject();
+        queueMessage(messageId);
     }
 }
 
 async function toggleChapter(messageId, button) {
+    if (savingMessages.has(messageId)) return;
     const message = getContext()?.chat?.[messageId];
     if (!message) return;
     const next = !hasChapterMarker(message);
@@ -238,19 +245,74 @@ function injectButtons() {
 }
 
 function queueInject() {
-    if (injectFrame) cancelAnimationFrame(injectFrame);
+    refreshAllMessages = true;
+    refreshMenu = true;
+    scheduleInject();
+}
+
+function queueMessage(messageId) {
+    const id = Number(messageId);
+    if (!Number.isInteger(id) || id < 0) return;
+    document.querySelectorAll(`#chat .mes[mesid="${id}"]`).forEach((element) => pendingMessages.add(element));
+    if (pendingMessages.size) scheduleInject();
+}
+
+function scheduleInject() {
+    if (injectFrame) return;
     injectFrame = requestAnimationFrame(() => {
         injectFrame = 0;
-        ensureWandButton();
-        ensureBookExportButton();
-        injectButtons();
+        if (refreshMenu) {
+            refreshMenu = false;
+            ensureWandButton();
+            ensureBookExportButton();
+        }
+        if (refreshAllMessages) {
+            refreshAllMessages = false;
+            injectButtons();
+        } else {
+            pendingMessages.forEach((element) => {
+                if (element.isConnected && element.closest('#chat')) addButton(element);
+            });
+        }
+        pendingMessages.clear();
     });
+}
+
+function handleMutations(mutations) {
+    const selector = '#chat, #extensionsMenu, .mes[mesid], .extraMesButtons';
+    for (const mutation of mutations) {
+        const target = mutation.target;
+        if (!(target instanceof Element)) continue;
+        if (mutation.type === 'attributes') {
+            if (target.matches('#chat .mes[mesid]')) pendingMessages.add(target);
+            continue;
+        }
+        if (target.closest('#chat .mes_text')) continue;
+        if (target.closest('#extensionsMenu') && (!document.getElementById(WAND_BUTTON_ID) || !document.getElementById('sb-book-export'))) {
+            refreshMenu = true;
+        }
+        if (target.closest('#chat .extraMesButtons') && !target.closest('.extraMesButtons').querySelector(`.${BUTTON_CLASS}`)) {
+            const message = target.closest('.mes[mesid]');
+            if (message) pendingMessages.add(message);
+        }
+        for (const node of mutation.addedNodes) {
+            if (!(node instanceof Element)) continue;
+            const candidates = node.matches(selector) ? [node] : [];
+            candidates.push(...node.querySelectorAll(selector));
+            for (const candidate of candidates) {
+                if (candidate.id === 'extensionsMenu') refreshMenu = true;
+                const message = candidate.closest('#chat .mes[mesid]');
+                if (message) pendingMessages.add(message);
+            }
+        }
+    }
+    if (refreshMenu || pendingMessages.size) scheduleInject();
 }
 
 function handleMessageSwiped(messageId) {
     const message = getContext()?.chat?.[Number(messageId)];
     if (hasChapterMarker(message)) setChapterMarker(message, true);
-    queueInject();
+    queueMessage(messageId);
 }
 
 function initialize() {
@@ -258,15 +320,14 @@ function initialize() {
         event_types.CHAT_CHANGED,
         event_types.CHAT_LOADED,
         event_types.MORE_MESSAGES_LOADED,
-        event_types.MESSAGE_UPDATED,
-        event_types.USER_MESSAGE_RENDERED,
-        event_types.CHARACTER_MESSAGE_RENDERED,
     ];
     events.filter(Boolean).forEach((eventName) => eventSource.on(eventName, queueInject));
+    const messageEvents = [event_types.MESSAGE_UPDATED, event_types.USER_MESSAGE_RENDERED, event_types.CHARACTER_MESSAGE_RENDERED];
+    messageEvents.filter(Boolean).forEach((eventName) => eventSource.on(eventName, queueMessage));
     if (event_types.MESSAGE_SWIPED) eventSource.on(event_types.MESSAGE_SWIPED, handleMessageSwiped);
 
-    const observer = new MutationObserver(queueInject);
-    observer.observe(document.body, { childList: true, subtree: true });
+    const observer = new MutationObserver(handleMutations);
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['mesid'] });
     queueInject();
 }
 
